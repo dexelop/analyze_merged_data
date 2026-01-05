@@ -11,12 +11,12 @@ from datetime import datetime
 
 # 경로 설정
 BASE_DIR = Path(__file__).parent.parent
-INPUT_FILE = BASE_DIR / "input_merged_datas" / "example" / "result_2024_v01_20260105_155001.json"
-OUTPUT_DIR = BASE_DIR / "output" / "example"
+INPUT_FILE = BASE_DIR / "input_merged_datas" / "더제이의원" / "result_2024_v01_20260106_003732.json"
+OUTPUT_DIR = BASE_DIR / "output" / "더제이의원"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 회사명 (파일명에서 추출하거나 지정)
-COMPANY_NAME = "example"
+COMPANY_NAME = "더제이의원"
 
 # ============================================================
 # 1. 데이터 로드
