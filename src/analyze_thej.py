@@ -11,7 +11,7 @@ from datetime import datetime
 
 # 경로 설정
 BASE_DIR = Path(__file__).parent.parent
-INPUT_FILE = BASE_DIR / "input_merged_datas" / "더제이의원" / "result_2024_v01_20260106_003732.json"
+INPUT_FILE = BASE_DIR / "input_merged_datas" / "더제이의원" / "result_2024_v01_20260106_225407.json"
 OUTPUT_DIR = BASE_DIR / "output" / "더제이의원"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -22,10 +22,14 @@ COMPANY_NAME = "더제이의원"
 # 1. 데이터 로드
 # ============================================================
 print("1. 데이터 로드 중...")
-with open(INPUT_FILE, 'r', encoding='utf-8') as f:
-    raw = json.load(f)
 
-df = pd.DataFrame(raw['data'])
+# Excel 또는 JSON 파일 로드
+if INPUT_FILE.suffix == '.xlsx':
+    df = pd.read_excel(INPUT_FILE)
+else:
+    with open(INPUT_FILE, 'r', encoding='utf-8') as f:
+        raw = json.load(f)
+    df = pd.DataFrame(raw['data'])
 df_original = df.copy()  # 원본 보존
 print(f"   총 {len(df)}건 로드 완료")
 
@@ -34,19 +38,21 @@ print(f"   총 {len(df)}건 로드 완료")
 # ============================================================
 print("2. 파생 컬럼 생성 중...")
 
-# 2.1 is_vat: vat(86,87,88,89) vs 일반(나머지)
-def get_is_vat(ev_type):
-    if ev_type in [86, 87, 88, 89]:
-        return "vat"
-    return "일반"
-
-df['is_vat'] = df['증빙유형'].apply(get_is_vat)
-
-# 2.2 소스유형: 데이터소스 + is_vat 조합
+# 2.1 소스유형: 전표번호 기준으로 vat/일반 구분
+# - 카드미반영: 데이터소스가 '카드미반영'
+# - 분개장(vat): 전표번호 >= 50000 (매입매출장 파생)
+# - 분개장(일반): 전표번호 < 50000
 def get_source_type(row):
     if row['데이터소스'] == '카드미반영':
         return '카드미반영'
-    return f"분개장({row['is_vat']})"
+    # 전표번호를 숫자로 변환 (빈값이나 문자열 처리)
+    try:
+        slip_no = int(row['전표번호']) if row['전표번호'] else 0
+    except (ValueError, TypeError):
+        slip_no = 0
+    if slip_no >= 50000:
+        return '분개장(vat)'
+    return '분개장(일반)'
 
 df['소스유형'] = df.apply(get_source_type, axis=1)
 
@@ -92,6 +98,9 @@ print(f"   파생 컬럼 생성 완료")
 # ============================================================
 print("3. 기본 피벗 분석 중...")
 
+# 계정코드별 고유 매핑 생성 (정렬용)
+account_code_map = df.groupby('계정과목')['계정코드'].first().to_dict()
+
 pivot_basic = df.pivot_table(
     index=['정렬순서', '손익분류', '계정과목'],
     columns='소스유형',
@@ -119,7 +128,15 @@ pivot_basic['카드미반영'] = card_missing_sum.reindex(pivot_basic.index, fil
 # 총합계
 pivot_basic['총합계'] = pivot_basic[['분개장요약', '카드미반영']].sum(axis=1)
 
-pivot_basic = pivot_basic.sort_index(level=0)
+# reset_index하여 정렬 (정렬순서 → 손익분류 → 계정코드 순)
+pivot_basic = pivot_basic.reset_index()
+pivot_basic['계정코드'] = pivot_basic['계정과목'].map(account_code_map)
+pivot_basic = pivot_basic.sort_values(['정렬순서', '손익분류', '계정코드'])
+
+# 컬럼 순서 정리 (계정코드는 제외)
+col_order = ['정렬순서', '손익분류', '계정과목', '분개장(vat)', '분개장(일반)', '분개장요약', '카드미반영', '총합계']
+pivot_basic = pivot_basic[[c for c in col_order if c in pivot_basic.columns]]
+
 print(f"   기본 피벗: {len(pivot_basic)}행")
 
 # ============================================================
@@ -161,16 +178,18 @@ pivot_trader['카드미반영'] = card_missing_trader.reindex(pivot_trader.index
 # 총합계
 pivot_trader['총합계'] = pivot_trader[['분개장요약', '카드미반영']].sum(axis=1)
 
-# 정렬: 정렬순서 → 손익분류 → 계정과목 → 분개장요약(내림차순)
+# 정렬: 정렬순서 → 손익분류 → 계정코드 → 분개장요약(내림차순)
 pivot_trader = pivot_trader.reset_index()
+pivot_trader['계정코드'] = pivot_trader['계정과목'].map(account_code_map)
 pivot_trader = pivot_trader.sort_values(
-    by=['정렬순서', '손익분류', '계정과목', '분개장요약'],
+    by=['정렬순서', '손익분류', '계정코드', '분개장요약'],
     ascending=[True, True, True, False]
 )
 
-# 인덱스 재설정 (거래처 컬럼명 변경)
+# 컬럼명 변경 및 순서 정리 (계정코드 제외, MultiIndex 미사용)
 pivot_trader = pivot_trader.rename(columns={'거래처명_filled': '거래처'})
-pivot_trader = pivot_trader.set_index(['정렬순서', '손익분류', '계정과목', '거래처'])
+col_order = ['정렬순서', '손익분류', '계정과목', '거래처', '분개장(vat)', '분개장(일반)', '분개장요약', '카드미반영', '총합계']
+pivot_trader = pivot_trader[[c for c in col_order if c in pivot_trader.columns]]
 
 print(f"   기본_거래처추가_피벗: {len(pivot_trader)}행")
 
@@ -245,14 +264,17 @@ pivot_trader_ev = full_index.merge(
 ev_type_sort_order = {v: i for i, v in enumerate(ev_type_order)}
 pivot_trader_ev['증빙유형_순서'] = pivot_trader_ev['증빙유형'].map(ev_type_sort_order).fillna(999)
 
-# 정렬: 정렬순서 → 손익분류 → 계정과목 → 거래처(합계 내림차순) → 증빙유형(코드순)
+# 계정코드 추가 (정렬용)
+pivot_trader_ev['계정코드'] = pivot_trader_ev['계정과목'].map(account_code_map)
+
+# 정렬: 정렬순서 → 손익분류 → 계정코드 → 거래처(합계 내림차순) → 증빙유형(코드순)
 pivot_trader_ev = pivot_trader_ev.sort_values(
-    by=['정렬순서', '손익분류', '계정과목', '거래처_분개장요약_합계', '거래처명_filled', '증빙유형_순서'],
+    by=['정렬순서', '손익분류', '계정코드', '거래처_분개장요약_합계', '거래처명_filled', '증빙유형_순서'],
     ascending=[True, True, True, False, True, True]
 )
 
 # 불필요한 컬럼 제거
-pivot_trader_ev = pivot_trader_ev.drop(columns=['거래처_분개장요약_합계', '증빙유형_순서'])
+pivot_trader_ev = pivot_trader_ev.drop(columns=['거래처_분개장요약_합계', '증빙유형_순서', '계정코드'])
 
 # 증빙유형 dict 변환
 pivot_trader_ev['증빙유형'] = pivot_trader_ev['증빙유형'].map(evidence_names).fillna(pivot_trader_ev['증빙유형'].astype(str))
@@ -264,10 +286,250 @@ pivot_trader_ev = pivot_trader_ev.rename(columns={'거래처명_filled': '거래
 col_order = ['정렬순서', '손익분류', '계정과목', '거래처', '증빙유형', '분개장(vat)', '분개장(일반)', '분개장요약', '카드미반영', '총합계']
 pivot_trader_ev = pivot_trader_ev[[c for c in col_order if c in pivot_trader_ev.columns]]
 
-# 인덱스 설정
-pivot_trader_ev = pivot_trader_ev.set_index(['정렬순서', '손익분류', '계정과목', '거래처', '증빙유형'])
+# 인덱스 설정하지 않음 (MultiIndex merged cell 문제 방지)
+# pivot_trader_ev = pivot_trader_ev.set_index(['정렬순서', '손익분류', '계정과목', '거래처', '증빙유형'])
 
 print(f"   기본_거래처_증빙유형: {len(pivot_trader_ev)}행")
+
+# ============================================================
+# 3-4. total_월별추이_가로 (Option B: 소스유형 × 월별 컬럼)
+# ============================================================
+print("3-4. total_월별추이_가로 분석 중...")
+
+# 월별 + 소스유형별 피벗
+monthly_wide = df.pivot_table(
+    index=['정렬순서', '손익분류', '계정과목', '거래처명_filled', '증빙유형'],
+    columns=['월', '소스유형'],
+    values='순액',
+    aggfunc='sum',
+    fill_value=0
+)
+
+# 컬럼 평탄화 (01_분개장(vat), 01_분개장(일반), ...)
+monthly_wide.columns = [f'{month}_{source}' for month, source in monthly_wide.columns]
+monthly_wide = monthly_wide.reset_index()
+
+# 계정코드 추가하여 정렬
+monthly_wide['계정코드'] = monthly_wide['계정과목'].map(account_code_map)
+
+# 거래처별 합계 계산 (정렬용)
+value_cols = [c for c in monthly_wide.columns if c not in ['정렬순서', '손익분류', '계정과목', '거래처명_filled', '증빙유형', '계정코드']]
+monthly_wide['거래처_합계'] = monthly_wide[value_cols].sum(axis=1)
+
+# 증빙유형 순서 매핑
+monthly_wide['증빙유형_순서'] = monthly_wide['증빙유형'].map(ev_type_sort_order).fillna(999)
+
+# 정렬: 정렬순서 → 손익분류 → 계정코드 → 거래처합계(내림차순) → 증빙유형순서
+monthly_wide = monthly_wide.sort_values(
+    by=['정렬순서', '손익분류', '계정코드', '거래처_합계', '증빙유형_순서'],
+    ascending=[True, True, True, False, True]
+)
+
+# 정리용 컬럼 제거
+monthly_wide = monthly_wide.drop(columns=['계정코드', '거래처_합계', '증빙유형_순서'])
+
+# 컬럼명 변경
+monthly_wide = monthly_wide.rename(columns={'거래처명_filled': '거래처'})
+
+# 증빙유형 dict 변환
+monthly_wide['증빙유형'] = monthly_wide['증빙유형'].map(evidence_names).fillna(monthly_wide['증빙유형'].astype(str))
+
+# 월별 컬럼 순서 정렬 (소스유형별 그룹 → 월 순서)
+# 결과: 01_vat, 02_vat, ..., 12_vat, 01_일반, 02_일반, ..., 12_일반, 01_카드미반영, ...
+base_cols = ['정렬순서', '손익분류', '계정과목', '거래처', '증빙유형']
+def get_col_sort_key(col_name):
+    month = col_name[:2]  # '01', '02', etc.
+    if 'vat' in col_name:
+        source_order = 0
+    elif '일반' in col_name:
+        source_order = 1
+    else:  # 카드미반영
+        source_order = 2
+    return (source_order, month)
+
+month_cols = sorted([c for c in monthly_wide.columns if c not in base_cols], key=get_col_sort_key)
+monthly_wide = monthly_wide[base_cols + month_cols]
+
+# 합계 컬럼 추가
+monthly_wide['합계'] = monthly_wide[month_cols].sum(axis=1)
+
+print(f"   total_월별추이_가로: {len(monthly_wide)}행, {len(monthly_wide.columns)}컬럼")
+
+# ============================================================
+# 3-5. total_월별추이_세로 (Option C: 월을 행으로)
+# ============================================================
+print("3-5. total_월별추이_세로 분석 중...")
+
+# 월별 + 소스유형별 피벗 (월을 행에 포함)
+monthly_long = df.pivot_table(
+    index=['정렬순서', '손익분류', '계정과목', '거래처명_filled', '증빙유형', '월'],
+    columns='소스유형',
+    values='순액',
+    aggfunc='sum',
+    fill_value=0
+).reset_index()
+
+# 컬럼 순서 정리
+base_cols_long = ['분개장(vat)', '분개장(일반)']
+for col in base_cols_long:
+    if col not in monthly_long.columns:
+        monthly_long[col] = 0
+
+# 분개장요약
+monthly_long['분개장요약'] = monthly_long.get('분개장(vat)', 0) + monthly_long.get('분개장(일반)', 0)
+
+# 카드미반영 컬럼
+if '카드미반영' not in monthly_long.columns:
+    monthly_long['카드미반영'] = 0
+
+# 총합계
+monthly_long['총합계'] = monthly_long['분개장요약'] + monthly_long['카드미반영']
+
+# 계정코드 추가하여 정렬
+monthly_long['계정코드'] = monthly_long['계정과목'].map(account_code_map)
+
+# 거래처별 총합계 계산 (정렬용)
+trader_total = monthly_long.groupby(['정렬순서', '손익분류', '계정과목', '거래처명_filled'])['총합계'].sum().reset_index()
+trader_total = trader_total.rename(columns={'총합계': '거래처_총합계'})
+monthly_long = monthly_long.merge(trader_total, on=['정렬순서', '손익분류', '계정과목', '거래처명_filled'])
+
+# 증빙유형 순서 매핑
+monthly_long['증빙유형_순서'] = monthly_long['증빙유형'].map(ev_type_sort_order).fillna(999)
+
+# 정렬: 정렬순서 → 손익분류 → 계정코드 → 거래처총합계(내림차순) → 증빙유형순서 → 월
+monthly_long = monthly_long.sort_values(
+    by=['정렬순서', '손익분류', '계정코드', '거래처_총합계', '거래처명_filled', '증빙유형_순서', '월'],
+    ascending=[True, True, True, False, True, True, True]
+)
+
+# 정리용 컬럼 제거
+monthly_long = monthly_long.drop(columns=['계정코드', '거래처_총합계', '증빙유형_순서'])
+
+# 컬럼명 변경
+monthly_long = monthly_long.rename(columns={'거래처명_filled': '거래처'})
+
+# 증빙유형 dict 변환
+monthly_long['증빙유형'] = monthly_long['증빙유형'].map(evidence_names).fillna(monthly_long['증빙유형'].astype(str))
+
+# 컬럼 순서 정리
+col_order_long = ['정렬순서', '손익분류', '계정과목', '거래처', '증빙유형', '월', '분개장(vat)', '분개장(일반)', '분개장요약', '카드미반영', '총합계']
+monthly_long = monthly_long[[c for c in col_order_long if c in monthly_long.columns]]
+
+print(f"   total_월별추이_세로: {len(monthly_long)}행")
+
+# ============================================================
+# 3-6. total_월별추이_가로_빈도 (거래 횟수 기준)
+# ============================================================
+print("3-6. total_월별추이_가로_빈도 분석 중...")
+
+# 월별 + 소스유형별 피벗 (거래 횟수)
+monthly_wide_cnt = df.pivot_table(
+    index=['정렬순서', '손익분류', '계정과목', '거래처명_filled', '증빙유형'],
+    columns=['월', '소스유형'],
+    values='순액',
+    aggfunc='count',
+    fill_value=0
+)
+
+# 컬럼 평탄화
+monthly_wide_cnt.columns = [f'{month}_{source}' for month, source in monthly_wide_cnt.columns]
+monthly_wide_cnt = monthly_wide_cnt.reset_index()
+
+# 계정코드 추가하여 정렬
+monthly_wide_cnt['계정코드'] = monthly_wide_cnt['계정과목'].map(account_code_map)
+
+# 거래처별 합계 계산 (정렬용)
+value_cols_cnt = [c for c in monthly_wide_cnt.columns if c not in ['정렬순서', '손익분류', '계정과목', '거래처명_filled', '증빙유형', '계정코드']]
+monthly_wide_cnt['거래처_합계'] = monthly_wide_cnt[value_cols_cnt].sum(axis=1)
+
+# 증빙유형 순서 매핑
+monthly_wide_cnt['증빙유형_순서'] = monthly_wide_cnt['증빙유형'].map(ev_type_sort_order).fillna(999)
+
+# 정렬
+monthly_wide_cnt = monthly_wide_cnt.sort_values(
+    by=['정렬순서', '손익분류', '계정코드', '거래처_합계', '증빙유형_순서'],
+    ascending=[True, True, True, False, True]
+)
+
+# 정리용 컬럼 제거
+monthly_wide_cnt = monthly_wide_cnt.drop(columns=['계정코드', '거래처_합계', '증빙유형_순서'])
+
+# 컬럼명 변경
+monthly_wide_cnt = monthly_wide_cnt.rename(columns={'거래처명_filled': '거래처'})
+
+# 증빙유형 dict 변환
+monthly_wide_cnt['증빙유형'] = monthly_wide_cnt['증빙유형'].map(evidence_names).fillna(monthly_wide_cnt['증빙유형'].astype(str))
+
+# 월별 컬럼 순서 정렬 (소스유형별 그룹 → 월 순서)
+base_cols_cnt = ['정렬순서', '손익분류', '계정과목', '거래처', '증빙유형']
+month_cols_cnt = sorted([c for c in monthly_wide_cnt.columns if c not in base_cols_cnt], key=get_col_sort_key)
+monthly_wide_cnt = monthly_wide_cnt[base_cols_cnt + month_cols_cnt]
+
+# 합계 컬럼 추가
+monthly_wide_cnt['합계'] = monthly_wide_cnt[month_cols_cnt].sum(axis=1)
+
+print(f"   total_월별추이_가로_빈도: {len(monthly_wide_cnt)}행, {len(monthly_wide_cnt.columns)}컬럼")
+
+# ============================================================
+# 3-7. total_월별추이_세로_빈도 (거래 횟수 기준)
+# ============================================================
+print("3-7. total_월별추이_세로_빈도 분석 중...")
+
+# 월별 + 소스유형별 피벗 (거래 횟수, 월을 행에 포함)
+monthly_long_cnt = df.pivot_table(
+    index=['정렬순서', '손익분류', '계정과목', '거래처명_filled', '증빙유형', '월'],
+    columns='소스유형',
+    values='순액',
+    aggfunc='count',
+    fill_value=0
+).reset_index()
+
+# 컬럼 순서 정리
+for col in ['분개장(vat)', '분개장(일반)']:
+    if col not in monthly_long_cnt.columns:
+        monthly_long_cnt[col] = 0
+
+# 분개장요약
+monthly_long_cnt['분개장요약'] = monthly_long_cnt.get('분개장(vat)', 0) + monthly_long_cnt.get('분개장(일반)', 0)
+
+# 카드미반영 컬럼
+if '카드미반영' not in monthly_long_cnt.columns:
+    monthly_long_cnt['카드미반영'] = 0
+
+# 총합계
+monthly_long_cnt['총합계'] = monthly_long_cnt['분개장요약'] + monthly_long_cnt['카드미반영']
+
+# 계정코드 추가하여 정렬
+monthly_long_cnt['계정코드'] = monthly_long_cnt['계정과목'].map(account_code_map)
+
+# 거래처별 총합계 계산 (정렬용)
+trader_total_cnt = monthly_long_cnt.groupby(['정렬순서', '손익분류', '계정과목', '거래처명_filled'])['총합계'].sum().reset_index()
+trader_total_cnt = trader_total_cnt.rename(columns={'총합계': '거래처_총합계'})
+monthly_long_cnt = monthly_long_cnt.merge(trader_total_cnt, on=['정렬순서', '손익분류', '계정과목', '거래처명_filled'])
+
+# 증빙유형 순서 매핑
+monthly_long_cnt['증빙유형_순서'] = monthly_long_cnt['증빙유형'].map(ev_type_sort_order).fillna(999)
+
+# 정렬
+monthly_long_cnt = monthly_long_cnt.sort_values(
+    by=['정렬순서', '손익분류', '계정코드', '거래처_총합계', '거래처명_filled', '증빙유형_순서', '월'],
+    ascending=[True, True, True, False, True, True, True]
+)
+
+# 정리용 컬럼 제거
+monthly_long_cnt = monthly_long_cnt.drop(columns=['계정코드', '거래처_총합계', '증빙유형_순서'])
+
+# 컬럼명 변경
+monthly_long_cnt = monthly_long_cnt.rename(columns={'거래처명_filled': '거래처'})
+
+# 증빙유형 dict 변환
+monthly_long_cnt['증빙유형'] = monthly_long_cnt['증빙유형'].map(evidence_names).fillna(monthly_long_cnt['증빙유형'].astype(str))
+
+# 컬럼 순서 정리
+col_order_long_cnt = ['정렬순서', '손익분류', '계정과목', '거래처', '증빙유형', '월', '분개장(vat)', '분개장(일반)', '분개장요약', '카드미반영', '총합계']
+monthly_long_cnt = monthly_long_cnt[[c for c in col_order_long_cnt if c in monthly_long_cnt.columns]]
+
+print(f"   total_월별추이_세로_빈도: {len(monthly_long_cnt)}행")
 
 # ============================================================
 # 4. 거래처별 분석 (판관비 중심)
@@ -555,14 +817,26 @@ with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
     # 원본 데이터 (맨 앞)
     df_original.to_excel(writer, sheet_name='원본데이터', index=False)
 
-    # 1. 기본 피벗
-    pivot_basic.to_excel(writer, sheet_name='기본피벗')
+    # 1. 기본 피벗 - index=False로 병합 셀 문제 방지
+    pivot_basic.to_excel(writer, sheet_name='기본피벗', index=False)
 
-    # 1-2. 기본_거래처추가_피벗 (NEW)
-    pivot_trader.to_excel(writer, sheet_name='기본_거래처추가_피벗')
+    # 1-2. 기본_거래처추가_피벗 (NEW) - index=False로 병합 셀 문제 방지
+    pivot_trader.to_excel(writer, sheet_name='기본_거래처추가_피벗', index=False)
 
-    # 1-3. 기본_거래처_증빙유형 (NEW)
-    pivot_trader_ev.to_excel(writer, sheet_name='기본_거래처_증빙유형')
+    # 1-3. 기본_거래처_증빙유형 (NEW) - index=False로 병합 셀 문제 방지
+    pivot_trader_ev.to_excel(writer, sheet_name='기본_거래처_증빙유형', index=False)
+
+    # 1-4. total_월별추이_가로 (소스유형 × 월별 컬럼)
+    monthly_wide.to_excel(writer, sheet_name='total_월별추이_가로', index=False)
+
+    # 1-5. total_월별추이_세로 (월을 행으로)
+    monthly_long.to_excel(writer, sheet_name='total_월별추이_세로', index=False)
+
+    # 1-6. total_월별추이_가로_빈도 (거래 횟수)
+    monthly_wide_cnt.to_excel(writer, sheet_name='total_월별추이_가로_빈도', index=False)
+
+    # 1-7. total_월별추이_세로_빈도 (거래 횟수)
+    monthly_long_cnt.to_excel(writer, sheet_name='total_월별추이_세로_빈도', index=False)
 
     # 2. 월별 추이
     monthly_trend.to_excel(writer, sheet_name='월별추이')
